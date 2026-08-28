@@ -1,0 +1,23 @@
+# Source and test files
+src/
+__tests__/
+
+# Configuration files
+jest.config.js
+tsconfig.json
+.gitignore
+.npmignore
+
+# Internal audit reports
+PHASE_*.md
+CORRECTIONS_APPLIED.md
+
+# Build and temporary artifacts
+*.log
+*.tgz
+node.zip
+
+# Environment and system
+.DS_Store
+.env
+.env.local
