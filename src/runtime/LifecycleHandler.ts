@@ -10,8 +10,29 @@ export interface LifecycleHandler {
   id: string;
   callable: (event: LifecycleEvent, context: LifecycleContext) => Promise<void>;
   supportedEvents: readonly string[];
-  priority: number; // Higher = executes earlier
-  enabled: boolean;
+  /** Higher = executes earlier. Default when omitted: 0. */
+  priority?: number;
+  /**
+   * Whether the handler is dispatched. Default when omitted: true (enabled),
+   * matching LifecycleHandlerImpl, registerCallback() and the Laravel runtime.
+   * Only an explicit `false` disables a handler. Non-boolean values are
+   * rejected by LifecycleManager.register() (NOD-07).
+   */
+  enabled?: boolean;
+}
+
+/**
+ * Effective enabled state of a handler (unspecified ⇒ enabled).
+ */
+export function isHandlerEnabled(handler: LifecycleHandler): boolean {
+  return handler.enabled !== false;
+}
+
+/**
+ * Effective priority of a handler (unspecified ⇒ 0).
+ */
+export function handlerPriority(handler: LifecycleHandler): number {
+  return typeof handler.priority === 'number' ? handler.priority : 0;
 }
 
 /**

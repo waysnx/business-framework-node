@@ -90,7 +90,9 @@ export class ValidationFramework {
     // Get rule metadata
     const ruleType = rule.type || 'custom';
     const severity = rule.severity || 'error';
-    const message = rule.message || `Rule '${ruleId}' failed`;
+    // Only the rule's own message is used here; each evaluator supplies a
+    // field-specific default when the rule does not define one.
+    const message = rule.message || '';
 
     try {
       // Evaluate based on rule type
@@ -98,14 +100,20 @@ export class ValidationFramework {
         case 'required':
           return this.evaluateRequired(validationId, ruleId, rule, request, severity, message);
         case 'range':
-          return this.evaluateRange(validationId, ruleId, rule, request, severity, message);
+          return this.evaluateRange(validationId, ruleId, rule, request, severity, message || `Rule '${ruleId}' failed`);
         case 'format':
-          return this.evaluateFormat(validationId, ruleId, rule, request, severity, message);
+          return this.evaluateFormat(validationId, ruleId, rule, request, severity, message || `Rule '${ruleId}' failed`);
         case 'custom':
-          return this.evaluateCustom(rule);
+          return await this.evaluateCustom(validationId, ruleId, rule, request);
         default:
-          // Unknown rule type - treat as passing
-          return undefined;
+          // Phase 0 (D2): unknown rule types fail closed as errors.
+          return ValidationFramework.frameworkIssue(
+            validationId,
+            ruleId,
+            ValidationFramework.CODE_UNKNOWN_RULE,
+            `Rule '${ruleId}' has unsupported rule type '${ruleType}'`,
+            { ruleType, field: rule.field }
+          );
       }
     } catch (error) {
       // Rule evaluation error - create issue
@@ -130,16 +138,26 @@ export class ValidationFramework {
     message: string
   ): ValidationIssue | undefined {
     const field = rule.field;
-    if (!field) return undefined;
+    if (!field) {
+      // A required rule without a target cannot be evaluated: fail closed.
+      return ValidationFramework.frameworkIssue(
+        validationId,
+        ruleId,
+        ValidationFramework.CODE_INVALID_RULE,
+        `Rule '${ruleId}' of type 'required' has no target field`,
+        { ruleType: 'required' }
+      );
+    }
 
     const value = this.getNestedValue(request, field);
 
-    if (value === null || value === undefined || value === '') {
+    if (ValidationFramework.isMissingOrEmpty(value)) {
       return new ValidationIssue({
         validationId: validationId,
         severity: severity as 'error' | 'warning',
         message: message || `Field '${field}' is required`,
         context: { ruleId, field },
+        code: rule.code || ValidationFramework.CODE_REQUIRED,
       });
     }
 
@@ -213,13 +231,68 @@ export class ValidationFramework {
   }
 
   /**
-   * Evaluate custom rule
-   * Custom rules are evaluated via a function in metadata
+   * Evaluate custom rule (application extension point).
+   *
+   * Phase 0 (D2): the framework has no built-in custom rule implementation, so
+   * the default FAILS CLOSED with WBF.VALIDATION.UNKNOWN_RULE instead of
+   * silently passing. Applications implement custom rules by subclassing
+   * ValidationFramework and overriding this method (mirrors the Laravel
+   * runtime's evaluateRule() extension point). Return undefined when the rule
+   * passes, or a ValidationIssue when it fails.
    */
-  private async evaluateCustom(_rule: any): Promise<ValidationIssue | undefined> {
-    // Custom rules would need to be registered via metadata
-    // For now, treat as passing
-    return undefined;
+  protected async evaluateCustom(
+    validationId: string,
+    ruleId: string,
+    rule: any,
+    _request: any
+  ): Promise<ValidationIssue | undefined> {
+    return ValidationFramework.frameworkIssue(
+      validationId,
+      ruleId,
+      ValidationFramework.CODE_UNKNOWN_RULE,
+      `Rule '${ruleId}' is a custom rule with no application implementation`,
+      { ruleType: 'custom', field: rule?.field }
+    );
+  }
+
+  /** Issue code for rule types the framework cannot evaluate (fail closed). */
+  static readonly CODE_UNKNOWN_RULE = 'WBF.VALIDATION.UNKNOWN_RULE';
+  /** Issue code for structurally invalid rule definitions (fail closed). */
+  static readonly CODE_INVALID_RULE = 'WBF.VALIDATION.INVALID_RULE';
+  /** Default issue code for failed required rules without their own code. */
+  static readonly CODE_REQUIRED = 'WBF.VALIDATION.REQUIRED';
+
+  /**
+   * Required-rule semantics (Phase 0 validation contract, identical in the
+   * Laravel runtime): missing, null, a string that is empty after trimming
+   * whitespace, or an empty array.
+   */
+  static isMissingOrEmpty(value: unknown): boolean {
+    if (value === null || value === undefined) return true;
+    if (typeof value === 'string' && value.trim() === '') return true;
+    if (Array.isArray(value) && value.length === 0) return true;
+    return false;
+  }
+
+  /**
+   * Framework-detected failure. Always error severity regardless of the rule's
+   * declared severity: an unevaluable rule must never be downgraded to a
+   * non-blocking warning.
+   */
+  private static frameworkIssue(
+    validationId: string,
+    ruleId: string,
+    code: string,
+    message: string,
+    context: Record<string, any>
+  ): ValidationIssue {
+    return new ValidationIssue({
+      validationId,
+      severity: 'error',
+      message,
+      context: { ruleId, ...context },
+      code,
+    });
   }
 
   /**

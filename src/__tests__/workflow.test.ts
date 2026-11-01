@@ -5,13 +5,20 @@ import {
   BusinessFunctionRuntime,
   LifecycleManager,
   LifecycleEvent,
+  AuthorizationDecisions,
+  Authorizer,
 } from '../runtime';
+
 import {
   WorkflowDefinition,
   WorkflowStep,
   BusinessFunctionDefinition,
 } from '../definitions';
 import { WorkflowRegistry } from '../registries';
+
+// Phase 0 (NOD-03): authorization fails closed; fixtures that exercise
+// post-authorization behavior must provide an explicit allow decision.
+const allowAll: Authorizer = () => AuthorizationDecisions.allow('test fixture');
 
 describe('Phase 3 Workflow', () => {
   describe('WorkflowContext', () => {
@@ -277,7 +284,7 @@ describe('Phase 3 Workflow', () => {
       });
 
       // Create runtime and register
-      const runtime = new BusinessFunctionRuntime(fn);
+      const runtime = new BusinessFunctionRuntime(fn, undefined, undefined, allowAll);
       const handler = async () => ({ requestId: 'req-001', status: 'pending' });
       runtime.registerHandler(handler);
 
@@ -350,11 +357,11 @@ describe('Phase 3 Workflow', () => {
         capability: 'SEND_WELCOME',
       });
 
-      const runtime1 = new BusinessFunctionRuntime(fn1);
+      const runtime1 = new BusinessFunctionRuntime(fn1, undefined, undefined, allowAll);
       runtime1.registerHandler(async () => ({ valid: true }));
       engine.registerBusinessFunction('HR.VALIDATE.VALIDATE_EMPLOYEE', runtime1);
 
-      const runtime2 = new BusinessFunctionRuntime(fn2);
+      const runtime2 = new BusinessFunctionRuntime(fn2, undefined, undefined, allowAll);
       runtime2.registerHandler(async () => ({ sent: true }));
       engine.registerBusinessFunction('HR.ONBOARD.SEND_WELCOME', runtime2);
 
@@ -405,7 +412,7 @@ describe('Phase 3 Workflow', () => {
         capability: 'FAIL_FUNCTION',
       });
 
-      const runtime = new BusinessFunctionRuntime(fn);
+      const runtime = new BusinessFunctionRuntime(fn, undefined, undefined, allowAll);
       const handler = async () => {
         throw new Error('Business logic failed');
       };
@@ -474,7 +481,7 @@ describe('Phase 3 Workflow', () => {
           capability: fnId,
         });
 
-        const runtime = new BusinessFunctionRuntime(fn);
+        const runtime = new BusinessFunctionRuntime(fn, undefined, undefined, allowAll);
 
         if (fnId === 'HR.FUNC2') {
           runtime.registerHandler(async () => {
@@ -534,7 +541,7 @@ describe('Phase 3 Workflow', () => {
         capability: 'FUNC',
       });
 
-      const runtime = new BusinessFunctionRuntime(fn);
+      const runtime = new BusinessFunctionRuntime(fn, undefined, undefined, allowAll);
       runtime.registerHandler(async () => ({ ok: true }));
       engine.registerBusinessFunction('HR.FUNC', runtime);
 
@@ -652,7 +659,7 @@ describe('Phase 3 Workflow', () => {
         capability: 'FUNC',
       });
 
-      const runtime = new BusinessFunctionRuntime(fn);
+      const runtime = new BusinessFunctionRuntime(fn, undefined, undefined, allowAll);
       runtime.registerHandler(async () => ({ ok: true }));
       engine.registerBusinessFunction('HR.FUNC', runtime);
 

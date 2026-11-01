@@ -1,4 +1,4 @@
-import { WorkflowDefinition } from '../definitions';
+import { WorkflowDefinition, WorkflowStep } from '../definitions';
 import { WorkflowRegistry } from '../registries';
 import { LifecycleManager } from './LifecycleManager';
 import { BusinessFunctionRuntime } from './BusinessFunctionRuntime';
@@ -67,8 +67,16 @@ export class WorkflowEngine {
       // Dispatch lifecycle event: beforeWorkflow
       await this.dispatchLifecycleEvent('beforeWorkflow', executionContext);
 
+      // NOD-02: step order is defined by `sequence`, never by declaration
+      // (array) order. Structurally invalid step definitions (duplicate step
+      // IDs or duplicate sequences) fail the run before any step executes.
+      // Missing/invalid sequence values are already rejected by WorkflowStep.
+      errors.push(...WorkflowEngine.validateSteps(workflow.steps));
+      const orderedSteps =
+        errors.length === 0 ? [...workflow.steps].sort((a, b) => a.sequence - b.sequence) : [];
+
       // Execute each step in sequence
-      for (const step of workflow.steps) {
+      for (const step of orderedSteps) {
         // Update context with current step
         executionContext = executionContext.withCurrentStep(step.id);
 
@@ -106,8 +114,8 @@ export class WorkflowEngine {
         await this.dispatchLifecycleEvent('afterStep', executionContext);
       }
 
-      // Determine workflow status
-      const status = failedSteps.length === 0 ? 'completed' : 'failed';
+      // Determine workflow status: any failed step or definition error fails the run
+      const status = failedSteps.length === 0 && errors.length === 0 ? 'completed' : 'failed';
       const duration = Date.now() - startTime;
 
       // Dispatch lifecycle event: workflowCompleted or workflowFailed
@@ -187,7 +195,7 @@ export class WorkflowEngine {
     // Check if execution succeeded
     if (!result.succeeded()) {
       throw new Error(
-        `Business function '${step.businessFunctionId}' failed: ${result.error?.message || 'Unknown error'}`
+        `Business function '${step.businessFunctionId}' failed: ${result.errorMessage || 'Unknown error'}`
       );
     }
   }
@@ -252,6 +260,34 @@ export class WorkflowEngine {
     });
 
     await this.lifecycleManager.dispatch(event, lifecycleContext);
+  }
+
+  /**
+   * Validate step definitions (Phase 0 workflow sequencing contract):
+   * step IDs and sequence values must be unique.
+   */
+  private static validateSteps(steps: readonly WorkflowStep[]): string[] {
+    const errors: string[] = [];
+    const ids = new Set<string>();
+    const sequences = new Map<number, string>();
+
+    for (const step of steps) {
+      if (ids.has(step.id)) {
+        errors.push(`Invalid workflow definition: duplicate step id '${step.id}'`);
+      }
+      ids.add(step.id);
+
+      const existing = sequences.get(step.sequence);
+      if (existing !== undefined) {
+        errors.push(
+          `Invalid workflow definition: duplicate sequence ${step.sequence} (steps '${existing}' and '${step.id}')`
+        );
+      } else {
+        sequences.set(step.sequence, step.id);
+      }
+    }
+
+    return errors;
   }
 
   /**

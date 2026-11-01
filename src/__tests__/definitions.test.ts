@@ -101,7 +101,8 @@ describe('Definition Objects - Immutability & Serialization', () => {
           sequence: -1,
           businessFunctionId: 'fn1',
         });
-      }).toThrow('valid sequence');
+        // D8 (Phase 0.1): clearer WorkflowDefinitionError message (was 'WorkflowStep requires valid sequence')
+      }).toThrow("sequence must be >= 0");
     });
   });
 
