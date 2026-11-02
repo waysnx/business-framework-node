@@ -1,4 +1,9 @@
-import { LifecycleHandler, LifecycleHandlerImpl } from './LifecycleHandler';
+import {
+  LifecycleHandler,
+  LifecycleHandlerImpl,
+  isHandlerEnabled,
+  handlerPriority,
+} from './LifecycleHandler';
 import { LifecycleEvent } from './LifecycleEvent';
 import { LifecycleContext } from './LifecycleContext';
 
@@ -19,6 +24,18 @@ export class LifecycleManager {
     if (!handler) throw new Error('Cannot register null handler');
     if (this.handlerMap.has(handler.id)) {
       throw new Error(`Handler with id '${handler.id}' already registered`);
+    }
+    // NOD-07: make enablement explicit. Omitted ⇒ enabled (documented default);
+    // any non-boolean value is rejected instead of silently disabling the handler.
+    if (handler.enabled !== undefined && typeof handler.enabled !== 'boolean') {
+      throw new Error(
+        `Handler '${handler.id}': 'enabled' must be a boolean when specified (got ${typeof handler.enabled})`
+      );
+    }
+    if (handler.priority !== undefined && typeof handler.priority !== 'number') {
+      throw new Error(
+        `Handler '${handler.id}': 'priority' must be a number when specified (got ${typeof handler.priority})`
+      );
     }
 
     this.handlerMap.set(handler.id, handler);
@@ -72,7 +89,7 @@ export class LifecycleManager {
   isEnabled(handlerId: string): boolean {
     const handler = this.handlerMap.get(handlerId);
     if (!handler) return false;
-    return handler.enabled;
+    return isHandlerEnabled(handler);
   }
 
   /**
@@ -81,7 +98,7 @@ export class LifecycleManager {
   isDisabled(handlerId: string): boolean {
     const handler = this.handlerMap.get(handlerId);
     if (!handler) return false;
-    return !handler.enabled;
+    return !isHandlerEnabled(handler);
   }
 
   /**
@@ -98,12 +115,12 @@ export class LifecycleManager {
         }
       }
       // Sort by priority descending (higher priority first)
-      return result.sort((a, b) => b.priority - a.priority);
+      return result.sort((a, b) => handlerPriority(b) - handlerPriority(a));
     }
 
     // Return all handlers sorted by priority
     const result = Array.from(this.handlerMap.values());
-    return result.sort((a, b) => b.priority - a.priority);
+    return result.sort((a, b) => handlerPriority(b) - handlerPriority(a));
   }
 
   /**
@@ -152,7 +169,7 @@ export class LifecycleManager {
     const handlers = this.getHandlers(event.name);
 
     for (const handler of handlers) {
-      if (!handler.enabled) continue;
+      if (!isHandlerEnabled(handler)) continue;
 
       try {
         await handler.callable(event, context);

@@ -2,9 +2,24 @@
  * Runtime module - Business Function and Workflow execution
  */
 
-export { BusinessFunctionRuntime, BusinessFunctionHandler } from './BusinessFunctionRuntime';
+export {
+  BusinessFunctionRuntime,
+  BusinessFunctionHandler,
+  Authorizer,
+  AuthorizationDecision,
+  AuthorizationDecisions,
+  ErrorReporter,
+  UnexpectedErrorReport,
+  defaultErrorReporter,
+} from './BusinessFunctionRuntime';
 export { BusinessFunctionContext } from './BusinessFunctionContext';
-export { BusinessFunctionResult } from './BusinessFunctionResult';
+export {
+  BusinessFunctionResult,
+  BusinessFunctionStatus,
+  BUSINESS_FUNCTION_STATUSES,
+  EXECUTION_FAILURE_SAFE_MESSAGE,
+  executionFailureSafeMessage,
+} from './BusinessFunctionResult';
 export { LifecycleEvent, LifecycleEventNames } from './LifecycleEvent';
 export { LifecycleContext } from './LifecycleContext';
 export { LifecycleHandler, LifecycleHandlerImpl } from './LifecycleHandler';

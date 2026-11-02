@@ -1,3 +1,5 @@
+import { WorkflowDefinitionError } from '../errors/WorkflowDefinitionError';
+
 /**
  * WorkflowStep
  * Immutable definition of a step in a workflow
@@ -19,8 +21,29 @@ export class WorkflowStep {
     metadata?: Record<string, any>;
   }) {
     if (!props.id) throw new Error('WorkflowStep requires id');
-    if (typeof props.sequence !== 'number' || props.sequence < 0) {
-      throw new Error('WorkflowStep requires valid sequence');
+    // WBF-SPEC-0007 / decision D8 (approved 2026-11-01): sequence is required,
+    // must be an integer, and must be >= 0. There is no implicit default; 0 is valid.
+    const sequence: unknown = props.sequence;
+    if (sequence === undefined || sequence === null) {
+      throw new WorkflowDefinitionError(
+        `Workflow step '${props.id}': sequence is required`,
+        'missing_sequence',
+        { stepId: props.id }
+      );
+    }
+    if (typeof sequence !== 'number' || !Number.isInteger(sequence)) {
+      throw new WorkflowDefinitionError(
+        `Workflow step '${props.id}': sequence must be an integer, got ${typeof sequence === 'number' ? sequence : typeof sequence}`,
+        'invalid_sequence',
+        { stepId: props.id }
+      );
+    }
+    if (sequence < 0) {
+      throw new WorkflowDefinitionError(
+        `Workflow step '${props.id}': sequence must be >= 0, got ${sequence}`,
+        'negative_sequence',
+        { stepId: props.id }
+      );
     }
     if (!props.businessFunctionId) throw new Error('WorkflowStep requires businessFunctionId');
 

@@ -1,7 +1,11 @@
 # WaysNX Business Framework - Node.js/TypeScript Implementation
 
-**Version:** 0.4.0  
-**Status:** Phase 1+2+3+4 - Foundation + Runtime + Workflow Engine + CLI/CREATEDemo (Pre-Production)
+**Version:** 0.4.0 (`package.json`; no release tag yet)  
+**Status:** Early implementation (pre-production). See [WBF Compatibility Status](#wbf-compatibility-status).
+
+> **Phase 0 behavior changes (2026-10-31).** Authorization now fails closed and requires an explicit `Authorizer` decision. Validation fails closed for unknown and unimplemented `custom` rules. Workflow steps run by `sequence`, not array order. Invalid or `null` requests return a structured `validation_failure`. See `docs/WBF_COMPATIBILITY_AUDIT.md`.
+>
+> **Phase 0.1 breaking changes (2026-11-01).** Result statuses changed: `rule_failure` → `business_rule_failure`, `failure` → `authorization_failure` / `not_found` / `execution_failure` (see [Result statuses](#result-statuses-phase-01-breaking)). Workflow step `sequence` must be an integer `>= 0`, and invalid or duplicate sequences throw `WorkflowDefinitionError` at construction.
 
 ## Overview
 
@@ -18,7 +22,7 @@ This is the Node.js/TypeScript implementation of the WaysNX Business Framework (
 ## Project Structure
 
 ```
-implementations/node/
+business-framework-node/
 ├── src/
 │   ├── types/                          # Portable interface contracts
 │   │   ├── EntityInterface.ts
@@ -53,11 +57,8 @@ implementations/node/
 │   │   ├── BusinessRuleViolation.ts
 │   │   ├── ResourceNotFound.ts
 │   │   ├── ConflictError.ts
-│   │   ├── ExecutionError.ts            # Phase 2
-│   │   ├── RequestValidationError.ts    # Phase 2
-│   │   ├── ResponseValidationError.ts   # Phase 2
-│   │   ├── ExecutionTimeoutError.ts     # Phase 2
-│   │   ├── HandlerNotFoundError.ts      # Phase 2
+│   │   ├── ExecutionError.ts            # Phase 2: ExecutionError + RequestValidationError,
+│   │   │                                #   ResponseValidationError, ExecutionTimeoutError, HandlerNotFoundError
 │   │   └── index.ts
 │   ├── runtime/                        # Phase 2: Runtime execution
 │   │   ├── BusinessFunctionRuntime.ts  # 6-step execution pipeline
@@ -73,13 +74,18 @@ implementations/node/
 │   │   ├── WorkflowContext.ts          # Phase 3: Workflow execution context
 │   │   ├── WorkflowResult.ts           # Phase 3: Workflow execution result
 │   │   └── index.ts
+│   ├── cli/                            # Phase 4: `wbf` CLI (bin, commands, demo, tests)
 │   ├── __tests__/                      # Test suites
 │   │   ├── errors.test.ts              # Phase 1
 │   │   ├── definitions.test.ts         # Phase 1
 │   │   ├── registries.test.ts          # Phase 1
 │   │   ├── runtime.test.ts             # Phase 2
-│   │   └── workflow.test.ts            # Phase 3
+│   │   ├── workflow.test.ts            # Phase 3
+│   │   ├── phase0-remediation.test.ts  # Phase 0 regression tests (NOD-01/02/03/06/07, validation)
+│   │   ├── conformance.test.ts         # Shared WBF conformance adapter
+│   │   └── conformance-known-differences.json
 │   └── index.ts
+├── docs/                               # WBF compatibility audit and plans
 ├── package.json
 ├── tsconfig.json
 ├── jest.config.js
@@ -91,7 +97,8 @@ implementations/node/
 ### Installation
 
 ```bash
-cd implementations/node
+git clone https://github.com/waysnx/business-framework-node.git
+cd business-framework-node
 npm install
 ```
 
@@ -123,15 +130,24 @@ Phase 2 introduces runtime execution infrastructure for business function execut
 Executes business functions with a fixed 6-step pipeline:
 
 1. **validateRequest** - Validate request matches contract
-2. **checkAuthorization** - Check caller present if authorization required (Phase 2: presence only, enforcement deferred to Phase 3+)
+2. **checkAuthorization** - **Fails closed.** Requires an explicit decision `{ allowed: true }` from the configured `Authorizer`. With no authorizer, an invalid decision or a deny, the result fails with `errorCategory: 'AuthorizationError'`
 3. **evaluateBusinessRules** - Execute validation rules (optional)
 4. **executeBusiness** - Execute handler logic
 5. **publishEvents** - Publish domain events
 6. **transformToResponse** - Ensure response matches contract
 
 ```typescript
-// Create runtime from definition
-const runtime = new BusinessFunctionRuntime(functionDefinition);
+import { BusinessFunctionRuntime, AuthorizationDecisions, Authorizer } from '@waysnx/business-framework';
+
+// Host-supplied authorization decision point (WBF does not authenticate or own policies).
+// The caller is identity input to the decision, never proof of authorization.
+const authorizer: Authorizer = async (request, context, definition) =>
+  (await myPolicyService.can(context.caller, definition.id))
+    ? AuthorizationDecisions.allow()
+    : AuthorizationDecisions.deny('Policy denied');
+
+// Create runtime from definition (4th argument: authorizer; or call runtime.setAuthorizer(...))
+const runtime = new BusinessFunctionRuntime(functionDefinition, undefined, undefined, authorizer);
 
 // Register business logic handler
 runtime.registerHandler(async (request) => {
@@ -145,17 +161,55 @@ const result = await runtime.execute(request, callerId);
 if (result.succeeded()) {
   console.log('Response:', result.response);
 } else {
-  console.error('Error:', result.error?.message);
+  // Public, safe message (for execution_failure: generic text + reference)
+  console.error('Error:', result.errorMessage, result.errorReference);
 }
 ```
 
 The runtime ensures:
-- Immutable execution context and results
-- Request/response validation
-- Caller presence check for protected operations (permission enforcement deferred)
+- Frozen execution context and results (shallow `Object.freeze`)
+- Request is a non-null plain object. Other values, including `null`, return `status: 'validation_failure'` (contract-schema validation is not yet implemented)
+- Fail-closed authorization. `error.context.reason` is `no_authorizer`, `invalid_decision` or `denied` (API names final, ADR-0010 approved 2026-11-01)
 - Business rule enforcement
 - Event publishing
 - Error propagation with detailed context
+
+#### Result statuses (Phase 0.1, breaking)
+
+`result.status` is one of six values (Core WBF-SPEC-0006, decision D1). Constructing a `BusinessFunctionResult` with any other value throws.
+
+| Status | Raised by |
+|---|---|
+| `success` | — |
+| `validation_failure` | `RequestValidationError`, `ValidationError` |
+| `authorization_failure` | `AuthorizationError` |
+| `not_found` | `ResourceNotFound` (missing **business** resource) |
+| `business_rule_failure` | `BusinessRuleViolation` |
+| `execution_failure` | everything else, including `HandlerNotFoundError`, registry `NotFoundError`, `ResponseValidationError` and unexpected errors |
+
+Migration from earlier versions (values replaced directly, no compatibility alias):
+
+| Before | After |
+|---|---|
+| `rule_failure` | `business_rule_failure` |
+| `failure` with `errorCategory: 'AuthorizationError'` | `authorization_failure` |
+| `failure` with `errorCategory: 'ResourceNotFound'` | `not_found` |
+| `failure` otherwise (incl. missing handler) | `execution_failure` |
+| `validation_failure` from `ResponseValidationError` | `execution_failure` |
+
+`result.failed()` is `status !== 'success'`; `isRuleFailure()` checks `business_rule_failure`. Code that compared against `'failure'` or `'rule_failure'` must be updated. `BusinessFunctionRuntime.classify(error)` exposes the mapping.
+
+An error thrown by the `Authorizer` itself (rather than returning a deny decision) is unexpected and yields `execution_failure`, not `authorization_failure`. Deny with `AuthorizationDecisions.deny()` or throw `AuthorizationError`.
+
+#### Public error messages (ADR-0009 amendment A1, BF-ERR-03)
+
+- For `execution_failure`, `result.errorMessage` / `getErrorMessage()` is always `An internal error occurred while executing the business function. Reference: <executionId>`, and `result.errorReference` is the execution ID. The raw error message is never in `toObject()`, `toJson()` or `JSON.stringify(result)`.
+- The original error stays on `result.error` for in-process diagnostics. It is non-enumerable and never serialized.
+- Every `execution_failure` is reported server-side with the same reference. The default reporter calls `console.error(message, error)`. Plug in your logger with `runtime.setErrorReporter((message, report) => logger.error(message, report))`; `report.error` is the original error.
+- Validation, authorization, not-found and business-rule failures keep their messages and are not reported.
+- Workflow step errors embed the public message, not the raw one.
+
+Migration: code that read `result.error.message` or `getErrorMessage()` to show an internal error must use the log entry (by reference) or `result.error` instead.
 
 ### ValidationFramework
 
@@ -173,10 +227,13 @@ const warnings = issues.filter(i => i.isWarning());
 ```
 
 Supports rule types:
-- **required** - Field presence validation
-- **range** - Min/max value validation
-- **format** - Pattern/regex validation
-- **custom** - Extension point for custom rules
+- **required** - fails when the field is missing, `null`, an empty or whitespace-only string, or an empty array (`0`/`false` are present). Code `WBF.VALIDATION.REQUIRED`
+- **range** - min/max value (or length) validation
+- **format** - pattern/regex validation
+- **custom** - **fails closed** (`WBF.VALIDATION.UNKNOWN_RULE`) unless your application subclasses `ValidationFramework` and overrides the protected `evaluateCustom()`
+- **any other type** - fails closed as an error (`WBF.VALIDATION.UNKNOWN_RULE`), even if declared as a warning
+
+Warnings are returned in the issue list and never block. Note: `BusinessFunctionRuntime` currently reports only error-level issues (as `business_rule_failure`) and does not surface warnings in its result (finding NOD-04, planned for M4).
 
 ### LifecycleManager
 
@@ -202,15 +259,14 @@ await lifecycle.dispatch(event, context);
 ```
 
 Handlers:
-- Execute in priority order (highest first)
-- Are observational only (cannot prevent execution)
+- Execute in priority order (highest first). `priority` is optional and defaults to `0`
+- Are enabled unless `enabled: false` is given. `enabled` is optional and **defaults to `true`**, the same as `registerCallback()` and the Laravel runtime. A non-boolean `enabled` is rejected at registration
 - Receive lifecycle events and context
-- Can be enabled/disabled
-- Propagate exceptions to caller
+- Propagate exceptions to the caller. A throwing handler aborts the current dispatch, so handlers are not strictly observational
 
 ### Immutable Context & Results
 
-All execution contexts and results are deeply immutable:
+Execution contexts and results are frozen with `Object.freeze`. The freeze is **shallow**: nested objects inside `request`, `entity` or `response` are not frozen.
 
 ```typescript
 const context = new BusinessFunctionContext({
@@ -220,7 +276,6 @@ const context = new BusinessFunctionContext({
   moduleId: 'HR',
   request: { /* ... */ },
   caller: 'user-123',
-  timestamp: new Date(),
 });
 
 // Cannot modify
@@ -252,8 +307,8 @@ Orchestrates workflow execution by executing steps sequentially through register
 // Create engine with registries
 const engine = new WorkflowEngine(workflowRegistry, lifecycleManager);
 
-// Register business function handlers for each step
-const applyLeaveRuntime = new BusinessFunctionRuntime(applyLeaveFn);
+// Register business function handlers for each step (each runtime needs an authorizer)
+const applyLeaveRuntime = new BusinessFunctionRuntime(applyLeaveFn, undefined, undefined, authorizer);
 applyLeaveRuntime.registerHandler(async (request) => {
   // Apply leave logic
   return { requestId: 'req-001', status: 'pending' };
@@ -284,10 +339,14 @@ if (result.succeeded()) {
 ```
 
 The engine:
-- Executes workflow steps sequentially in order of `step.sequence`
+- Executes workflow steps in ascending `step.sequence` order, regardless of declaration (array) order
+- Fails the run before any step executes when step IDs or `sequence` values are duplicated (defensive check)
+
+Sequencing contract (Core WBF-SPEC-0007, decision D8): `sequence` is required and must be an integer `>= 0` (`0` is valid). `new WorkflowStep(...)` throws `WorkflowDefinitionError` (`reason`: `missing_sequence`, `invalid_sequence`, `negative_sequence`) and `new WorkflowDefinition(...)` throws it with `duplicate_sequence`. Previously a plain `Error` was thrown, non-integer values such as `1.5` were accepted, and duplicates were only detected at execution.
 - Implements fail-fast semantics: stops on first step failure
 - Integrates with Phase 2 LifecycleManager for event dispatch
-- Publishes 8 standard lifecycle events (beforeWorkflow, beforeStep, stepCompleted, stepFailed, afterStep, workflowCompleted, workflowFailed, afterWorkflow)
+- Publishes lifecycle events: beforeWorkflow, beforeStep, stepCompleted, stepFailed, afterStep, workflowCompleted, workflowFailed, afterWorkflow. `afterStep` is currently dispatched **only after a successful step** (finding NOD-08)
+- Does not yet propagate the workflow `correlationId` to step executions (finding NOD-09)
 - Tracks execution state immutably via WorkflowContext
 - Returns immutable WorkflowResult with complete outcome
 
@@ -296,18 +355,19 @@ The engine:
 Applications override the protected `executeBusinessFunction` method to customize request mapping:
 
 ```typescript
+// The engine's runtime map is private: keep your own reference to the runtimes you register.
 class CustomWorkflowEngine extends WorkflowEngine {
+  constructor(registry: WorkflowRegistry, private runtimes: Map<string, BusinessFunctionRuntime>) {
+    super(registry);
+    for (const [id, rt] of runtimes) this.registerBusinessFunction(id, rt);
+  }
+
   protected async executeBusinessFunction(functionId: string, context: WorkflowContext) {
     // Map workflow context to business function request
-    const request = {
-      ...context.inputData,
-      employeeId: context.entity.id,
-      caller: context.caller,
-    };
-
-    // Execute via registered runtime
-    const runtime = this.businessFunctionRuntimes.get(functionId);
-    return await runtime.execute(request, context.caller);
+    const request = { ...context.inputData, employeeId: context.entity.id };
+    return this.runtimes.get(functionId)!.execute(request, context.caller, {
+      correlationId: context.correlationId,
+    });
   }
 }
 ```
@@ -351,7 +411,7 @@ context.toObject();                       // Plain object
 context.toJson();                         // JSON string
 ```
 
-Context is deeply immutable - all collections frozen, all updates return new derived context.
+Context is frozen (shallow): its own arrays are frozen and all updates return a new derived context. The `entity` object is stored by reference and is not frozen.
 
 ### WorkflowResult
 
@@ -390,7 +450,7 @@ result.toObject();                        // Plain object
 result.toJson();                          // JSON string
 ```
 
-Result is deeply immutable for reliable audit trails.
+Result is frozen (shallow).
 
 ### Lifecycle Integration
 
@@ -407,11 +467,13 @@ lifecycle.register({
     'beforeStep',          // Step about to execute
     'stepCompleted',       // Step succeeded
     'stepFailed',          // Step failed
-    'afterStep',           // Step execution done (success or fail)
+    'afterStep',           // Step done (currently only after success, NOD-08)
     'workflowCompleted',   // All steps succeeded
     'workflowFailed',      // Workflow stopped due to failure
     'afterWorkflow',       // Workflow done (success or fail)
   ],
+  // `priority` (default 0) and `enabled` (default true) are optional.
+  // Before Phase 0 a handler without `enabled: true` was silently never dispatched.
   callable: async (event, context) => {
     console.log(`Workflow Event: ${event.name}`);
     console.log(`  Execution: ${event.metadata.executionId}`);
@@ -660,9 +722,9 @@ Phase 1 does NOT include Runtime, WorkflowEngine, or other Phase 2+ features
 #### ✓ ValidationFramework Evaluates Rules
 
 Validation rule execution with issue classification:
-- Error-level violations throw BusinessRuleViolation
-- Warning-level violations logged but do not block
-- Supports required, range, format, and custom rule types
+- Error-level violations produce a `business_rule_failure` result (`BusinessRuleViolation` category)
+- Warning-level violations do not block (they are not logged or surfaced in the Business Function result yet)
+- Supports required, range and format. `custom` and unknown types fail closed (Phase 0)
 
 #### ✓ LifecycleManager Dispatches Events
 
@@ -675,7 +737,7 @@ Event handler management:
 #### ✓ Context & Results Immutable
 
 All execution contexts and results:
-- Deeply immutable via Object.freeze()
+- Frozen via Object.freeze() (shallow)
 - Serializable to JSON
 - Include complete execution metadata
 
@@ -1151,9 +1213,8 @@ The `wbf createdemo` demonstrates the complete WBF model through a Hospital Audi
 
 #### ✓ All Tests Pass
 
-- 31 CLI command tests
-- 20 demo execution tests
-- All 164 tests passing (Phase 1+2+3+4)
+- As of Phase 0.1 (2026-11-01): 9 suites, 283 tests passing, including the Phase 0/0.1 regression tests, the 33 shared conformance fixtures and the suite-integrity test (when the Core checkout is present)
+- Coverage: branch coverage 64.94% (Phase 0: 63.96%), below the configured 70% threshold, so `npx jest --coverage` fails. The threshold is unchanged and not enforced in CI (`npm test` runs without `--coverage`)
 
 #### ✓ Build and Lint Pass
 
@@ -1161,29 +1222,30 @@ The `wbf createdemo` demonstrates the complete WBF model through a Hospital Audi
 - npm run lint: 0 errors
 - TypeScript strict compilation passes
 
-## Next Steps (Phase 5+)
+## Not Yet Implemented
 
-Phase 4+ will implement:
-- Workflow persistence and state management
-- Retry logic and error recovery
-- Compensation and rollback mechanisms
-- Parallel and conditional step execution
-- Human task and approval workflows
-- CLI tools (wbf doctor, list, show, make, register, demo)
+The CLI tools and the Hospital Audit demo already ship. They are not future work. The following are not implemented:
+
+- Entity implementation, repository, persistence adapters and transactions (ADR-0006, blocked)
+- Request/response contract-schema validation
+- Event bus publication (`eventsPublished` lists declared events only)
+- Tenant context and tenant isolation
+- Workflow persistence, retry, compensation, parallel or conditional steps, human tasks
 - Framework adapters (Express, NestJS, Fastify)
-- Demo implementations (Hospital Audit, Employee Onboarding)
+- `wbf list` / `show` / `register` operate on empty registries. They do not load your application's definitions
 
-## Cross-Implementation Compatibility
+## WBF Compatibility Status
 
-This Node implementation maintains portable contracts identical to the Laravel implementation:
+| | |
+|---|---|
+| WBF specification targeted | WBF-SPEC-0000…0005 (Draft, Core tag `v1.0.0-preview`) |
+| Package status | Early implementation, `0.4.0`, no release tag |
+| Own test suite | Passing (`npm test`) |
+| Shared conformance suite | v0.1.0 (Core `tests/conformance/fixtures`, untagged): **33 of 33 fixtures pass**, plus the suite-integrity check, with no known differences. The suite covers narrow slices of validation, workflow sequencing, Business Function results, authorization and lifecycle enablement only |
+| Conformance CI | Prepared (`.github/workflows/conformance.yml`, manual trigger, pinned to `conformance-v0.1.0`). **Not active** until the Core tag exists |
+| Parity with the Laravel runtime | **Not claimed.** Both runtimes produce identical normalized outcomes for the 33 fixtures. Areas without fixtures (entities, events, serialization, error codes, execution context, tenancy) are unverified. See Core `docs/architecture/IMPLEMENTATION_CAPABILITY_MATRIX.md` |
 
-- Same entity contracts
-- Same module governance model
-- Same business function execution semantics
-- Same validation rule scopes
-- Same workflow definition structure
-- Same registry universal pattern
-- Same error categories
+Status vocabulary: Specified (Core spec exists) → Implemented → Tested (this repo) → Conformance verified (shared fixtures) → Released (tagged). See `docs/CONFORMANCE_TESTING.md`.
 
 ## License
 

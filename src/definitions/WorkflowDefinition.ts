@@ -1,4 +1,5 @@
 import { WorkflowStep } from './WorkflowStep';
+import { WorkflowDefinitionError } from '../errors/WorkflowDefinitionError';
 
 /**
  * WorkflowDefinition
@@ -46,6 +47,22 @@ export class WorkflowDefinition {
     if (!props.name) throw new Error('WorkflowDefinition requires name');
     if (!props.displayName) throw new Error('WorkflowDefinition requires displayName');
     if (!props.moduleId) throw new Error('WorkflowDefinition requires moduleId');
+
+    // WBF-SPEC-0007 / decision D8: sequences are unique within a workflow
+    // definition. Duplicates are rejected at construction; the engine keeps a
+    // defensive check for definitions created by other means.
+    const seen = new Map<number, string>();
+    for (const step of props.steps || []) {
+      const existing = seen.get(step.sequence);
+      if (existing !== undefined) {
+        throw new WorkflowDefinitionError(
+          `Workflow '${props.id}': duplicate sequence ${step.sequence} (steps '${existing}' and '${step.id}')`,
+          'duplicate_sequence',
+          { workflowId: props.id, sequence: step.sequence }
+        );
+      }
+      seen.set(step.sequence, step.id);
+    }
 
     this.id = props.id;
     this.name = props.name;
