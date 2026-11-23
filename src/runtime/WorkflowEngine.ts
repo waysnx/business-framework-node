@@ -264,7 +264,8 @@ export class WorkflowEngine {
 
   /**
    * Validate step definitions (Phase 0 workflow sequencing contract):
-   * step IDs and sequence values must be unique.
+   * step IDs and sequence values must be unique, and sequences must be non-negative.
+   * WBF-SPEC-0007 SEQ-06: Negative sequences are rejected at definition validation time.
    */
   private static validateSteps(steps: readonly WorkflowStep[]): string[] {
     const errors: string[] = [];
@@ -276,6 +277,11 @@ export class WorkflowEngine {
         errors.push(`Invalid workflow definition: duplicate step id '${step.id}'`);
       }
       ids.add(step.id);
+
+      // SEQ-06: Reject negative sequences (defensive check for malformed definitions)
+      if (step.sequence < 0) {
+        errors.push(`Invalid workflow definition: negative sequence ${step.sequence} in step '${step.id}'`);
+      }
 
       const existing = sequences.get(step.sequence);
       if (existing !== undefined) {

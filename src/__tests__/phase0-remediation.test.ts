@@ -353,6 +353,61 @@ describe('NOD-02: workflow sequence', () => {
     expect(result.errors.join(' ')).toContain("duplicate step id 's1'");
   });
 
+  test('negative sequence in definition fails before any step executes (D8 defensive validation)', async () => {
+    // Defensive test: bypass WorkflowStep constructor validation and directly
+    // supply a step with negative sequence to the execution engine.
+    // This validates that WorkflowEngine.validateSteps() catches negative sequences
+    // at definition validation time, before any business function executes.
+    const registry = new WorkflowRegistry();
+    
+    // Create a step with negative sequence by directly constructing it with Object.assign
+    // to bypass the WorkflowStep constructor's own validation.
+    const negativeSequenceStep: WorkflowStep = {
+      id: 's1',
+      sequence: -5,  // Invalid: negative sequence
+      businessFunctionId: 'A',
+    } as WorkflowStep;
+
+    registry.register(
+      new WorkflowDefinition({
+        id: 'wf',
+        name: 'wf',
+        displayName: 'wf',
+        description: 'test',
+        moduleId: 'T',
+        steps: [negativeSequenceStep],
+      })
+    );
+
+    const engine = new WorkflowEngine(registry);
+    const rt = new BusinessFunctionRuntime(bfDefinition('A'), undefined, undefined, allow);
+    let executed = false;
+    rt.registerHandler(async () => {
+      executed = true;
+      return {};
+    });
+    engine.registerBusinessFunction('A', rt);
+
+    const result = await engine.execute(
+      'wf',
+      new WorkflowContext({
+        workflowId: 'wf',
+        executionId: 'e1',
+        correlationId: 'c1',
+        moduleId: 'T',
+        entity: { id: 1 },
+        inputData: {},
+        caller: 'wf-user',
+      })
+    );
+
+    // Verify the workflow failed with the negative sequence error
+    expect(result.status).toBe('failed');
+    expect(executed).toBe(false);  // No business function executed
+    expect(result.errors.join(' ')).toContain('negative sequence');
+    expect(result.errors.length).toBeGreaterThan(0);
+  });
+
   test.each([
     ['omitted', undefined],
     ['null', null],
