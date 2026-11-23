@@ -24,6 +24,8 @@ import {
   LifecycleManager,
   WorkflowEngine,
   WorkflowContext,
+  Authorizer,
+  AuthorizationDecisions,
 } from '../../runtime';
 
 export interface DemoResult {
@@ -215,8 +217,16 @@ async function runAuditDemo(): Promise<DemoResult> {
   const lifecycleManager = new LifecycleManager();
   const workflowEngine = new WorkflowEngine(workflowRegistry, lifecycleManager);
 
+  // Demo authorizer (Phase 0, NOD-03): authorization fails closed, so the demo
+  // supplies an explicit decision that allows only the demo caller.
+  const DEMO_CALLER = 'audit-user';
+  const demoAuthorizer: Authorizer = (_request, ctx) =>
+    ctx.caller === DEMO_CALLER
+      ? AuthorizationDecisions.allow('demo caller')
+      : AuthorizationDecisions.deny('Only the demo caller may run the demo');
+
   // Register business function runtimes
-  const validateRuntime = new BusinessFunctionRuntime(validateAuditFn);
+  const validateRuntime = new BusinessFunctionRuntime(validateAuditFn, undefined, undefined, demoAuthorizer);
   validateRuntime.registerHandler(async () => {
     // Simulate validation
     return {
@@ -228,7 +238,7 @@ async function runAuditDemo(): Promise<DemoResult> {
   });
   workflowEngine.registerBusinessFunction('AUDIT.VALIDATE.AUDIT.VALIDATE_AUDIT', validateRuntime);
 
-  const recordRuntime = new BusinessFunctionRuntime(recordFindingFn);
+  const recordRuntime = new BusinessFunctionRuntime(recordFindingFn, undefined, undefined, demoAuthorizer);
   recordRuntime.registerHandler(async () => {
     // Simulate record finding
     return {
@@ -240,7 +250,7 @@ async function runAuditDemo(): Promise<DemoResult> {
   });
   workflowEngine.registerBusinessFunction('AUDIT.RECORD.FINDING.RECORD_FINDING', recordRuntime);
 
-  const completeRuntime = new BusinessFunctionRuntime(completeAuditFn);
+  const completeRuntime = new BusinessFunctionRuntime(completeAuditFn, undefined, undefined, demoAuthorizer);
   completeRuntime.registerHandler(async () => {
     // Simulate completion
     return {
@@ -267,7 +277,7 @@ async function runAuditDemo(): Promise<DemoResult> {
     moduleId: 'AUDIT',
     entity: testAudit,
     inputData: { auditData: testAudit },
-    caller: 'audit-user',
+    caller: DEMO_CALLER,
   });
 
   output += `Executing workflow "${auditWorkflow.displayName}"...\n`;

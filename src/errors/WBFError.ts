@@ -18,8 +18,12 @@ export class WBFError extends Error {
     this.context = context || {};
     this.timestamp = new Date();
 
-    // Maintain proper prototype chain
-    Object.setPrototypeOf(this, WBFError.prototype);
+    // Maintain proper prototype chain for every subclass (NOD-01).
+    // Using WBFError.prototype here reset subclasses that did not re-apply
+    // setPrototypeOf themselves (ExecutionError and its subclasses), so
+    // `instanceof RequestValidationError` was false and validation failures
+    // were misclassified. new.target is the constructor actually invoked.
+    Object.setPrototypeOf(this, new.target.prototype);
   }
 
   /**

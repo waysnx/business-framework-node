@@ -8,12 +8,19 @@ export class ValidationIssue {
   readonly severity: 'error' | 'warning';
   readonly message: string;
   readonly context: Readonly<Record<string, any>>;
+  /**
+   * Structured issue code (e.g. 'WBF.VALIDATION.REQUIRED',
+   * 'WBF.VALIDATION.UNKNOWN_RULE', or an application rule code).
+   * Optional for backward compatibility; framework-generated issues set it.
+   */
+  readonly code?: string;
 
   constructor(props: {
     validationId: string;
     severity: 'error' | 'warning';
     message: string;
     context?: Record<string, any>;
+    code?: string;
   }) {
     if (!props.validationId) throw new Error('ValidationIssue requires validationId');
     if (!props.severity) throw new Error('ValidationIssue requires severity');
@@ -23,6 +30,7 @@ export class ValidationIssue {
     this.severity = props.severity;
     this.message = props.message;
     this.context = Object.freeze({ ...(props.context || {}) });
+    if (props.code !== undefined) this.code = props.code;
 
     Object.freeze(this);
   }
@@ -49,6 +57,7 @@ export class ValidationIssue {
       validationId: this.validationId,
       severity: this.severity,
       message: this.message,
+      ...(this.code !== undefined ? { code: this.code } : {}),
       context: { ...this.context },
     };
   }

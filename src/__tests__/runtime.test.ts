@@ -7,9 +7,16 @@ import {
   LifecycleContext,
   ValidationFramework,
   ValidationIssue,
+  AuthorizationDecisions,
+  Authorizer,
 } from '../runtime';
+
 import { BusinessFunctionDefinition, ValidationDefinition } from '../definitions';
 import { ValidationRegistry } from '../registries';
+
+// Phase 0 (NOD-03): authorization fails closed; fixtures that exercise
+// post-authorization behavior must provide an explicit allow decision.
+const allowAll: Authorizer = () => AuthorizationDecisions.allow('test fixture');
 
 describe('Phase 2 Runtime', () => {
   describe('BusinessFunctionRuntime', () => {
@@ -40,7 +47,7 @@ describe('Phase 2 Runtime', () => {
         },
       });
 
-      runtime = new BusinessFunctionRuntime(definition);
+      runtime = new BusinessFunctionRuntime(definition, undefined, undefined, allowAll);
     });
 
     test('should create runtime from definition', () => {
@@ -74,7 +81,8 @@ describe('Phase 2 Runtime', () => {
       const request = { employeeId: 'emp-001' };
       const result = await runtime.execute(request, 'user-001');
 
-      expect(result.status).toBe('failure');
+      // D1: a missing handler is an execution failure, not not_found
+      expect(result.status).toBe('execution_failure');
       expect(result.succeeded()).toBe(false);
       expect(result.failed()).toBe(true);
       expect(result.error).toBeDefined();
@@ -99,12 +107,15 @@ describe('Phase 2 Runtime', () => {
 
       const result = await runtime.execute([] as any, 'user-001');
 
-      // Array should fail validation
+      // Array must be classified as a request-validation failure (NOD-01).
+      // Previously asserted with /validation_failure|failure/, which hid the
+      // misclassification caused by the broken error prototype chain.
       expect(result.failed()).toBe(true);
-      expect(result.status).toMatch(/validation_failure|failure/);
+      expect(result.status).toBe('validation_failure');
+      expect(result.errorCategory).toBe('ValidationError');
     });
 
-    test('should handle authorization check', async () => {
+    test('should require an explicit authorization decision (fail closed)', async () => {
       const def = new BusinessFunctionDefinition({
         id: 'HR.ADMIN.CONFIG',
         name: 'ConfigureHR',
@@ -118,19 +129,35 @@ describe('Phase 2 Runtime', () => {
         },
       });
 
-      const rt = new BusinessFunctionRuntime(def);
+      // Host-supplied authorizer: only 'admin-001' holds admin.hr.
+      const rt = new BusinessFunctionRuntime(def, undefined, undefined, (_req, ctx) =>
+        ctx.caller === 'admin-001'
+          ? AuthorizationDecisions.allow()
+          : AuthorizationDecisions.deny('admin.hr required')
+      );
       const handler = async () => ({});
       rt.registerHandler(handler);
-
-      // Execute WITH caller - should succeed (Phase 2 accepts any authenticated caller)
       const request = { config: {} };
-      const result = await rt.execute(request, 'user-001');
-      expect(result.succeeded()).toBe(true);
 
-      // Execute WITHOUT caller - should fail on authorization
-      const resultNoCaller = await rt.execute(request);
-      expect(resultNoCaller.failed()).toBe(true);
-      expect(resultNoCaller.errorCategory).toBe('AuthorizationError');
+      // Explicitly allowed caller succeeds
+      const allowed = await rt.execute(request, 'admin-001');
+      expect(allowed.succeeded()).toBe(true);
+
+      // Any other caller is denied: a caller value is not proof of authorization
+      const denied = await rt.execute(request, 'user-001');
+      expect(denied.failed()).toBe(true);
+      expect(denied.errorCategory).toBe('AuthorizationError');
+
+      // Missing caller is denied
+      const noCaller = await rt.execute(request);
+      expect(noCaller.errorCategory).toBe('AuthorizationError');
+
+      // No authorizer at all fails closed
+      const unconfigured = new BusinessFunctionRuntime(def);
+      unconfigured.registerHandler(handler);
+      const noAuthorizer = await unconfigured.execute(request, 'admin-001');
+      expect(noAuthorizer.failed()).toBe(true);
+      expect(noAuthorizer.errorCategory).toBe('AuthorizationError');
     });
 
     test('should track execution context', async () => {
@@ -164,7 +191,7 @@ describe('Phase 2 Runtime', () => {
         eventsPublished: ['leave.applied', 'notification.sent'],
       });
 
-      const rt = new BusinessFunctionRuntime(defWithEvents);
+      const rt = new BusinessFunctionRuntime(defWithEvents, undefined, undefined, allowAll);
       const handler = async () => ({});
       rt.registerHandler(handler);
 
@@ -545,7 +572,7 @@ describe('Phase 2 Runtime', () => {
       const result = new BusinessFunctionResult({
         executionId: 'exec-001',
         functionId: 'HR.LEAVE.APPLY',
-        status: 'failure',
+        status: 'execution_failure', // D1: replaces the pre-0.1 'failure' value
         error,
         errorCategory: 'TestError',
         duration: 100,
@@ -553,7 +580,26 @@ describe('Phase 2 Runtime', () => {
 
       expect(result.succeeded()).toBe(false);
       expect(result.failed()).toBe(true);
-      expect(result.getErrorMessage()).toBe('Test error');
+      // ADR-0009 amendment: execution_failure exposes only the safe message;
+      // the original error stays available for diagnostics.
+      expect(result.getErrorMessage()).toBe(
+        'An internal error occurred while executing the business function. Reference: exec-001'
+      );
+      expect(result.error).toBe(error);
+    });
+
+    test('rejects legacy or unknown status values (D1 migration guard)', () => {
+      for (const legacy of ['failure', 'rule_failure', 'nope']) {
+        expect(
+          () =>
+            new BusinessFunctionResult({
+              executionId: 'exec-001',
+              functionId: 'HR.LEAVE.APPLY',
+              status: legacy as any,
+              duration: 1,
+            })
+        ).toThrow('is not a WBF result status');
+      }
     });
 
     test('should serialize result to JSON', () => {

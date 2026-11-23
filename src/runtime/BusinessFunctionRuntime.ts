@@ -5,10 +5,13 @@ import { BusinessFunctionContext } from './BusinessFunctionContext';
 import { BusinessFunctionResult } from './BusinessFunctionResult';
 import { LifecycleEvent, LifecycleEventNames } from './LifecycleEvent';
 import { LifecycleContext } from './LifecycleContext';
+import { BusinessFunctionStatus } from './BusinessFunctionResult';
 import {
+  WBFError,
   ValidationError,
   AuthorizationError,
   BusinessRuleViolation,
+  ResourceNotFound,
   RequestValidationError,
   ResponseValidationError,
   HandlerNotFoundError,
@@ -25,6 +28,64 @@ export type BusinessFunctionHandler = (
 ) => Promise<any>;
 
 /**
+ * AuthorizationDecision
+ * Explicit outcome of an authorization check. Only `{ allowed: true }`
+ * permits execution. Status: public API, approved (decision D6, ADR-0010, 2026-11-01).
+ */
+export interface AuthorizationDecision {
+  allowed: boolean;
+  reason?: string;
+}
+
+/**
+ * Authorizer
+ * Host-application supplied decision point. WBF does not authenticate users
+ * or own policies; the caller in `context` is identity input to the decision,
+ * never proof of authorization by itself.
+ */
+export type Authorizer = (
+  request: any,
+  context: BusinessFunctionContext,
+  definition: BusinessFunctionDefinition
+) => AuthorizationDecision | Promise<AuthorizationDecision>;
+
+/**
+ * Convenience constructors for explicit decisions.
+ */
+export const AuthorizationDecisions = Object.freeze({
+  allow: (reason?: string): AuthorizationDecision => ({ allowed: true, reason }),
+  deny: (reason = 'Access denied'): AuthorizationDecision => ({ allowed: false, reason }),
+});
+
+/**
+ * Context passed to an ErrorReporter for an unexpected failure.
+ * `error` is the original error, with its message and stack.
+ */
+export interface UnexpectedErrorReport {
+  reference: string;
+  executionId: string;
+  correlationId: string;
+  functionId: string;
+  errorCategory: string;
+  error: unknown;
+}
+
+/**
+ * ErrorReporter
+ * Server-side sink for unexpected failures (execution_failure). The public
+ * result only carries a safe message and the reference (ADR-0009 amendment,
+ * BF-ERR-03); the full detail goes here, correlated by the same reference.
+ * Compatible with `logger.error(message, meta)` style loggers.
+ */
+export type ErrorReporter = (message: string, report: UnexpectedErrorReport) => void;
+
+/** Default reporter: console.error with the original error (message + stack). */
+export const defaultErrorReporter: ErrorReporter = (message, report) => {
+  // eslint-disable-next-line no-console
+  console.error(message, report.error);
+};
+
+/**
  * BusinessFunctionRuntime
  * Executes business functions with the fixed 6-step pipeline
  * 
@@ -38,11 +99,13 @@ export type BusinessFunctionHandler = (
  */
 export class BusinessFunctionRuntime {
   private handlers: Map<string, BusinessFunctionHandler> = new Map();
+  private errorReporter: ErrorReporter = defaultErrorReporter;
 
   constructor(
     private definition: BusinessFunctionDefinition,
     private validationFramework?: ValidationFramework,
-    private lifecycleManager?: LifecycleManager
+    private lifecycleManager?: LifecycleManager,
+    private authorizer?: Authorizer
   ) {
     if (!definition) throw new Error('BusinessFunctionRuntime requires BusinessFunctionDefinition');
   }
@@ -69,13 +132,17 @@ export class BusinessFunctionRuntime {
     const correlationId = metadata?.correlationId || executionId;
     const startTime = Date.now();
 
-    // Create execution context
+    // Create execution context.
+    // NOD-06: a null/non-object request must yield a structured
+    // validation_failure result, not an uncontrolled rejection. The context
+    // therefore never receives an invalid request; validateRequest() below
+    // rejects the original value inside the normal failure path.
     const context = new BusinessFunctionContext({
       functionId: this.definition.id,
       executionId,
       correlationId,
       moduleId: this.definition.moduleId,
-      request,
+      request: BusinessFunctionRuntime.isPlainObjectRequest(request) ? request : {},
       caller,
       metadata: { ...metadata, caller },
     });
@@ -91,8 +158,8 @@ export class BusinessFunctionRuntime {
       // Step 1: Validate request
       await this.validateRequest(request);
 
-      // Step 2: Check authorization
-      await this.checkAuthorization(caller);
+      // Step 2: Check authorization (fails closed, NOD-03)
+      await this.checkAuthorization(request, context);
 
       // Step 3: Evaluate business rules
       await this.evaluateBusinessRules(request);
@@ -124,26 +191,13 @@ export class BusinessFunctionRuntime {
         },
       });
     } catch (error) {
-      // Determine error status and category
-      let status: 'failure' | 'validation_failure' | 'rule_failure' = 'failure';
-      let errorCategory = (error as any).category || 'InternalSystemError';
+      // Classify into the WBF result statuses (WBF-SPEC-0006, decision D1)
+      const { status, errorCategory } = BusinessFunctionRuntime.classify(error);
 
-      // Check error type for status determination
-      if (error instanceof RequestValidationError || error instanceof ResponseValidationError) {
-        status = 'validation_failure';
-      } else if (error instanceof ValidationError || error instanceof RequestValidationError) {
-        status = 'validation_failure';
-        errorCategory = 'ValidationError';
-      } else if (error instanceof BusinessRuleViolation) {
-        status = 'rule_failure';
-        errorCategory = 'BusinessRuleViolation';
-      } else if (error instanceof AuthorizationError) {
-        errorCategory = 'AuthorizationError';
-      }
-      
-      // Override with category name for clarity
-      if (error instanceof RequestValidationError) {
-        errorCategory = 'ValidationError';
+      if (status === 'execution_failure') {
+        // Public result: safe message + reference only (BF-ERR-03).
+        // Server side: full detail, correlated by the same reference.
+        this.reportUnexpected(error, executionId, correlationId, errorCategory);
       }
 
       // Dispatch lifecycle event: functionFailed
@@ -195,31 +249,140 @@ export class BusinessFunctionRuntime {
 
   /**
    * Step 2: Check authorization
-   * Verify caller provided if authorization requirements exist
-   * Note: Phase 2 checks caller presence only. Permission verification deferred to Phase 3+
+   *
+   * Authorization FAILS CLOSED (Phase 0 decision D6, NOD-03). Execution
+   * proceeds only when the configured Authorizer returns a decision object
+   * whose `allowed` property is exactly `true`. Previously any truthy caller
+   * value was accepted, which treated caller-supplied data as proof of
+   * authorization.
+   *
+   * Failure modes (all raise AuthorizationError, category 'AuthorizationError'):
+   * - no authorizer configured             → context.reason 'no_authorizer'
+   * - authorizer returned a non-decision   → context.reason 'invalid_decision'
+   * - authorizer returned allowed: false   → context.reason 'denied'
    */
-  private async checkAuthorization(
-    caller: string | number | undefined
-  ): Promise<void> {
-    const authRequirements = (this.definition as any).authorizationRequirements || {};
+  private async checkAuthorization(request: any, context: BusinessFunctionContext): Promise<void> {
+    const base = { functionId: this.definition.id, step: 'checkAuthorization' };
 
-    // If no specific requirements, skip
-    if (!authRequirements.permissions || authRequirements.permissions.length === 0) {
-      return;
+    if (!this.authorizer) {
+      throw new AuthorizationError(
+        `Authorization required for '${this.definition.id}': no authorizer configured`,
+        { ...base, reason: 'no_authorizer' }
+      );
     }
 
-    // If no caller provided but permissions required, deny
-    if (!caller) {
-      throw new AuthorizationError('Caller required for this operation', {
-        functionId: this.definition.id,
-        step: 'checkAuthorization',
-        requiredPermissions: authRequirements.permissions,
+    const decision: unknown = await this.authorizer(request, context, this.definition);
+
+    if (
+      decision === null ||
+      typeof decision !== 'object' ||
+      typeof (decision as AuthorizationDecision).allowed !== 'boolean'
+    ) {
+      throw new AuthorizationError(
+        `Authorization failed for '${this.definition.id}': authorizer returned an invalid decision`,
+        { ...base, reason: 'invalid_decision' }
+      );
+    }
+
+    if ((decision as AuthorizationDecision).allowed !== true) {
+      const reason = (decision as AuthorizationDecision).reason || 'Access denied';
+      throw new AuthorizationError(`Authorization denied for '${this.definition.id}': ${reason}`, {
+        ...base,
+        reason: 'denied',
       });
     }
+  }
 
-    // In a full implementation, this would check caller against required permissions
-    // For now, we just accept any caller who is authenticated
-    // Example: const hasPermission = await authService.check(caller, authRequirements.permissions);
+  /**
+   * Set the authorizer (explicit authorization decision point).
+   * Status: public API, approved (decision D6, ADR-0010, 2026-11-01).
+   */
+  setAuthorizer(authorizer: Authorizer): this {
+    if (typeof authorizer !== 'function') throw new Error('Authorizer must be a function');
+    this.authorizer = authorizer;
+    return this;
+  }
+
+  /**
+   * Set the server-side reporter for unexpected failures (default:
+   * console.error). See ErrorReporter.
+   */
+  setErrorReporter(reporter: ErrorReporter): this {
+    if (typeof reporter !== 'function') throw new Error('ErrorReporter must be a function');
+    this.errorReporter = reporter;
+    return this;
+  }
+
+  private reportUnexpected(
+    error: unknown,
+    executionId: string,
+    correlationId: string,
+    errorCategory: string
+  ): void {
+    const message = `WBF execution_failure in business function '${this.definition.id}' (reference ${executionId})`;
+    const report: UnexpectedErrorReport = {
+      reference: executionId,
+      executionId,
+      correlationId,
+      functionId: this.definition.id,
+      errorCategory,
+      error,
+    };
+    try {
+      this.errorReporter(message, report);
+    } catch (reporterError) {
+      // A failing reporter must neither hide the original error nor turn the
+      // structured result into a rejection. Fall back to the default sink.
+      defaultErrorReporter(message, report);
+      defaultErrorReporter(`WBF error reporter failed while reporting reference ${executionId}`, {
+        ...report,
+        error: reporterError,
+      });
+    }
+  }
+
+  /**
+   * Whether an authorizer is configured.
+   */
+  hasAuthorizer(): boolean {
+    return !!this.authorizer;
+  }
+
+  /**
+   * Map a failure to a WBF result status (WBF-SPEC-0006 §3, decision D1).
+   *
+   * - Request validation errors          → validation_failure     (ValidationError)
+   * - AuthorizationError                 → authorization_failure  (AuthorizationError)
+   * - ResourceNotFound (business resource) → not_found            (ResourceNotFound)
+   * - BusinessRuleViolation              → business_rule_failure  (BusinessRuleViolation)
+   * - everything else, including a missing handler, an invalid response and
+   *   any unexpected error               → execution_failure      (own category or InternalSystemError)
+   *
+   * Registry NotFoundError (framework artifact lookup) is not a business
+   * resource and therefore maps to execution_failure, not not_found.
+   */
+  static classify(error: unknown): { status: BusinessFunctionStatus; errorCategory: string } {
+    if (error instanceof RequestValidationError || error instanceof ValidationError) {
+      return { status: 'validation_failure', errorCategory: 'ValidationError' };
+    }
+    if (error instanceof AuthorizationError) {
+      return { status: 'authorization_failure', errorCategory: 'AuthorizationError' };
+    }
+    if (error instanceof ResourceNotFound) {
+      return { status: 'not_found', errorCategory: 'ResourceNotFound' };
+    }
+    if (error instanceof BusinessRuleViolation) {
+      return { status: 'business_rule_failure', errorCategory: 'BusinessRuleViolation' };
+    }
+    const category = error instanceof WBFError ? error.category : 'InternalSystemError';
+    return { status: 'execution_failure', errorCategory: category || 'InternalSystemError' };
+  }
+
+  /**
+   * True when the request is a non-null, non-array object.
+   */
+  private static isPlainObjectRequest(request: unknown): request is Record<string, any> {
+    return request !== null && typeof request === 'object' && !Array.isArray(request);
   }
 
   /**

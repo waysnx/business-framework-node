@@ -1,0 +1,78 @@
+# WBF cross-runtime conformance (ADR-0008, approved 2026-11-01).
+#
+# Status: PREPARED, NOT ACTIVE. Manual trigger only.
+# Activation is pending until the Core fixtures are committed and the tag
+# conformance-v0.1.0 exists in waysnx/waysnx-business-framework. To activate,
+# add push/pull_request triggers (same branches as ci.yml). Until the tag
+# exists a manual run fails at the Core checkout step, which is intended.
+#
+# WBF_CONFORMANCE_REQUIRED=1 turns a missing or misconfigured Core checkout
+# into a hard "CONFIGURATION ERROR" failure instead of a skip. Any failing
+# fixture or suite-integrity problem fails the job.
+name: WBF Conformance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: conformance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WBF_CONFORMANCE_REF: conformance-v0.1.0
+  WBF_CONFORMANCE_REQUIRED: '1'
+  WBF_CONFORMANCE_FIXTURES: ${{ github.workspace }}/wbf-core/tests/conformance/fixtures
+  WBF_CONFORMANCE_REPORT: ${{ github.workspace }}/conformance-report-node.json
+
+jobs:
+  conformance:
+    name: Conformance (suite conformance-v0.1.0)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # Pinned to v4.0.0 (commit 11d5960, released 2024-07-16)
+        # Immutable SHA: pinned for reproducibility and supply-chain attack prevention
+        uses: actions/checkout@11d5960386772fe2a3bac13c20a58ce9e710ee99
+
+      - name: Checkout WBF Core fixtures (pinned)
+        # Pinned to v4.0.0 (commit 11d5960, released 2024-07-16)
+        # Immutable SHA: pinned for reproducibility
+        uses: actions/checkout@11d5960386772fe2a3bac13c20a58ce9e710ee99
+        with:
+          repository: waysnx/waysnx-business-framework
+          ref: ${{ env.WBF_CONFORMANCE_REF }}
+          path: wbf-core
+
+      - name: Verify Core checkout
+        run: |
+          test -f "$WBF_CONFORMANCE_FIXTURES/../suite.json" || {
+            echo "::error::CONFIGURATION ERROR: suite.json not found next to $WBF_CONFORMANCE_FIXTURES (ref $WBF_CONFORMANCE_REF)"
+            exit 1
+          }
+
+      - name: Setup Node.js
+        # Pinned to v4.0.0 (commit 49933ea, released 2024-04-02)
+        # Immutable SHA: pinned for reproducibility
+        uses: actions/setup-node@49933eaadcbb3b5c9c39f3cafa174c4c2da2a5eb
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run conformance suite
+        run: npx jest src/__tests__/conformance.test.ts
+
+      - name: Upload conformance report
+        if: always()
+        # Pinned to v4.0.0 (commit 3c51c3a, released 2024-11-21)
+        # Immutable SHA: pinned for reproducibility
+        uses: actions/upload-artifact@3c51c3ac9657c1e591411f868e5d78dd9e2e50d5
+        with:
+          name: conformance-report-node
+          path: conformance-report-node.json
+          if-no-files-found: warn
